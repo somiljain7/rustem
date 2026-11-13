@@ -95,7 +95,9 @@ The semantic embedding spaces of all three models on the same multilingual inten
 2. **Multilingual-E5-Small (INT8, 384d):** Cluster geometry is virtually identical to FP32, proving dynamic INT8 causes zero geometric distortion.
 3. **EmbeddingGemma-300M (768d):** Demonstrates significantly wider inter-cluster separation margins and tighter intra-cluster cohesion, explaining its **96.53% Recall@1** superiority.
 
-*The high-resolution visualization is saved in the repository at `data/similarity_heatmap.png` and generated via `scripts/plot_tsne_comparison.py`.*
+*The high-resolution visualization is saved in the repository at `data/tsne_models_comparison.png` (generated via `scripts/plot_tsne_comparison.py`):*
+
+![t-SNE Multi-Model Semantic Comparison](data/tsne_models_comparison.png)
 
 ---
 
