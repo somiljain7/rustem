@@ -1,0 +1,138 @@
+{
+  "Custom Rust/ORT (INT8)": [
+    {
+      "batch_size": 1,
+      "p50": 5.05,
+      "p95": 7.49,
+      "p99": 7.94,
+      "throughput": 184.0,
+      "mem_mb": 429.8
+    },
+    {
+      "batch_size": 8,
+      "p50": 33.56,
+      "p95": 38.26,
+      "p99": 39.7,
+      "throughput": 238.4,
+      "mem_mb": 435.3
+    },
+    {
+      "batch_size": 16,
+      "p50": 56.9,
+      "p95": 61.69,
+      "p99": 65.02,
+      "throughput": 278.2,
+      "mem_mb": 440.5
+    },
+    {
+      "batch_size": 64,
+      "p50": 236.6,
+      "p95": 245.4,
+      "p99": 247.07,
+      "throughput": 272.8,
+      "mem_mb": 468.9
+    }
+  ],
+  "FastEmbed (Quantized)": [
+    {
+      "batch_size": 1,
+      "p50": 8.23,
+      "p95": 10.2,
+      "p99": 10.81,
+      "throughput": 119.2,
+      "mem_mb": 1018.5
+    },
+    {
+      "batch_size": 8,
+      "p50": 41.27,
+      "p95": 48.11,
+      "p99": 53.75,
+      "throughput": 196.2,
+      "mem_mb": 1023.7
+    },
+    {
+      "batch_size": 16,
+      "p50": 73.19,
+      "p95": 81.67,
+      "p99": 84.15,
+      "throughput": 219.5,
+      "mem_mb": 1029.6
+    },
+    {
+      "batch_size": 64,
+      "p50": 307.09,
+      "p95": 366.4,
+      "p99": 409.87,
+      "throughput": 201.2,
+      "mem_mb": 1064.5
+    }
+  ],
+  "HuggingFace PyTorch (FP32)": [
+    {
+      "batch_size": 1,
+      "p50": 20.49,
+      "p95": 27.36,
+      "p99": 28.82,
+      "throughput": 48.1,
+      "mem_mb": 2109.8
+    },
+    {
+      "batch_size": 8,
+      "p50": 57.13,
+      "p95": 65.17,
+      "p99": 72.32,
+      "throughput": 141.7,
+      "mem_mb": 2115.5
+    },
+    {
+      "batch_size": 16,
+      "p50": 94.98,
+      "p95": 109.1,
+      "p99": 113.27,
+      "throughput": 167.0,
+      "mem_mb": 2119.8
+    },
+    {
+      "batch_size": 64,
+      "p50": 306.17,
+      "p95": 335.04,
+      "p99": 337.37,
+      "throughput": 205.7,
+      "mem_mb": 2139.4
+    }
+  ],
+  "HuggingFace TEI (HTTP Service)": [
+    {
+      "batch_size": 1,
+      "p50": 6.2,
+      "p95": 8.98,
+      "p99": 9.67,
+      "throughput": 174.8,
+      "mem_mb": 679.8
+    },
+    {
+      "batch_size": 8,
+      "p50": 34.71,
+      "p95": 39.75,
+      "p99": 41.43,
+      "throughput": 226.5,
+      "mem_mb": 685.3
+    },
+    {
+      "batch_size": 16,
+      "p50": 58.05,
+      "p95": 63.18,
+      "p99": 66.74,
+      "throughput": 264.3,
+      "mem_mb": 690.5
+    },
+    {
+      "batch_size": 64,
+      "p50": 237.75,
+      "p95": 246.9,
+      "p99": 248.79,
+      "throughput": 259.2,
+      "mem_mb": 718.9
+    }
+  ]
+}
