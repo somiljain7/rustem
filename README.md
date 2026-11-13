@@ -1,6 +1,6 @@
 # rustem
 
-A high-performance, multi-threaded CPU-only text embedding service and library written in Rust using ONNX Runtime (`ort`). Optimized for low-latency, real-time voice AI platforms (LiveKit) serving Indian languages: **Hindi, Marathi, Hinglish, Telugu, Tamil, and English**.
+A high-performance, multi-threaded CPU-only text embedding service and library written in Rust using ONNX Runtime (`ort`). Optimized for low-latency, real-time voice AI and intent-matching pipelines serving Indian languages: **Hindi, Marathi, Hinglish, Telugu, Tamil, and English**.
 
 ## Key Features
 - **Optimized for CPU Inference:** Dynamic INT8 quantization tailored for AVX2 execution, achieving **~5.1 ms p50 latency** for batch=1 utterances.
