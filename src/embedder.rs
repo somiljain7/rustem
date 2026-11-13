@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
-use ndarray::{Array2, Axis};
-use ort::session::{Session, builder::GraphOptimizationLevel};
-use parking_lot::Mutex;
-use rayon::prelude::*;
-use std::path::Path;
+use ort::session::builder::GraphOptimizationLevel;
 use std::sync::Arc;
-use tokenizers::Tokenizer;
-use tracing::{debug, info};
+use tokenizers::{Tokenizer, TruncationParams};
+use tracing::info;
+
+use crate::pool::{PoolConfig, SessionPool};
 
 /// Configuration for the Embedder
 #[derive(Debug, Clone)]
@@ -21,7 +19,7 @@ pub struct EmbedderConfig {
     pub intra_threads: usize,
     /// Maximum sequence length (tokens)
     pub max_length: usize,
-    /// Embedding dimension (auto-detected if 0)
+    /// Expected embedding dimension. 0 = auto-detect from the model output.
     pub embed_dim: usize,
     /// Whether to add E5 prefixes
     pub use_e5_prefix: bool,
@@ -41,7 +39,7 @@ impl Default for EmbedderConfig {
             num_sessions: 4,
             intra_threads: 2,
             max_length: 128,
-            embed_dim: 384, // multilingual-e5-small
+            embed_dim: 0, // auto-detect
             use_e5_prefix: true,
             query_prefix: "query: ".to_string(),
             passage_prefix: "passage: ".to_string(),
@@ -63,67 +61,71 @@ pub struct EmbedResult {
     pub total_us: u64,
 }
 
-/// Session pool entry
-struct SessionEntry {
-    session: Session,
-}
-
-/// The main embedder: holds a tokenizer and a pool of ONNX sessions
+/// The main embedder: a tokenizer plus a pool of ONNX sessions.
 pub struct Embedder {
     tokenizer: Tokenizer,
-    sessions: Vec<Mutex<SessionEntry>>,
+    pool: SessionPool,
     config: EmbedderConfig,
     embed_dim: usize,
+    pad_id: i64,
 }
 
 impl Embedder {
     /// Create a new Embedder with the given config
     pub fn new(config: EmbedderConfig) -> Result<Self> {
+        anyhow::ensure!(config.num_sessions > 0, "num_sessions must be > 0");
+        anyhow::ensure!(config.max_length > 0, "max_length must be > 0");
         info!(
             "Initializing embedder: {} sessions x {} intra-threads, max_len={}",
             config.num_sessions, config.intra_threads, config.max_length
         );
 
-        // Load tokenizer
-        let tokenizer = Tokenizer::from_file(&config.tokenizer_path)
+        // Tokenizer: configure truncation ONCE (previously cloned per text).
+        let mut tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: config.max_length,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("Failed to configure truncation: {}", e))?;
+        tokenizer.with_padding(None);
+        let pad_id = tokenizer.token_to_id("<pad>").unwrap_or(0) as i64;
 
-        // Initialize ONNX Runtime
         ort::init()
             .with_name("embed-service")
             .commit()
             .context("Failed to init ONNX Runtime")?;
 
-        // Create session pool
-        let mut sessions = Vec::with_capacity(config.num_sessions);
-        for i in 0..config.num_sessions {
-            let session = Session::builder()?
-                .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .with_intra_threads(config.intra_threads as u16)?
-                .with_inter_threads(1)?
-                .commit_from_file(&config.model_path)
-                .with_context(|| format!("Failed to create session {}", i))?;
+        let pool = SessionPool::new(&PoolConfig {
+            model_path: config.model_path.clone(),
+            num_sessions: config.num_sessions,
+            intra_threads: config.intra_threads,
+            optimization_level: GraphOptimizationLevel::Level3,
+        })?;
 
-            sessions.push(Mutex::new(SessionEntry { session }));
-            debug!("Created ONNX session {}", i);
-        }
-
-        // Detect embedding dimension from first session
-        let embed_dim = if config.embed_dim > 0 {
-            config.embed_dim
-        } else {
-            // Run a dummy input to detect dim
-            384 // default for e5-small
+        let mut embedder = Self {
+            tokenizer,
+            pool,
+            embed_dim: config.embed_dim,
+            config,
+            pad_id,
         };
 
-        info!("Embedder ready: embed_dim={}", embed_dim);
+        // Detect the real embedding dimension from the model output shape.
+        let probe = embedder.embed_batch(&["dim probe"], true)?;
+        let detected = probe.embeddings[0].len();
+        if embedder.config.embed_dim != 0 && embedder.config.embed_dim != detected {
+            anyhow::bail!(
+                "Configured embed_dim={} but model produces {}",
+                embedder.config.embed_dim,
+                detected
+            );
+        }
+        embedder.embed_dim = detected;
 
-        Ok(Self {
-            tokenizer,
-            sessions,
-            config,
-            embed_dim,
-        })
+        info!("Embedder ready: embed_dim={}", embedder.embed_dim);
+        Ok(embedder)
     }
 
     /// Get the embedding dimension
@@ -131,20 +133,31 @@ impl Embedder {
         self.embed_dim
     }
 
+    /// Number of ONNX sessions (max useful inference concurrency).
+    pub fn num_sessions(&self) -> usize {
+        self.config.num_sessions
+    }
+
     /// Embed a single text (query mode)
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.embed_batch(&[text], true)?;
-        Ok(results.embeddings.into_iter().next().unwrap())
+        self.embed_one(text, true)
     }
 
     /// Embed a single text (passage mode)
     pub fn embed_passage(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.embed_batch(&[text], false)?;
-        Ok(results.embeddings.into_iter().next().unwrap())
+        self.embed_one(text, false)
     }
 
-    /// Embed a batch of texts
-    /// is_query: if true, add "query: " prefix; if false, add "passage: " prefix
+    fn embed_one(&self, text: &str, is_query: bool) -> Result<Vec<f32>> {
+        self.embed_batch(&[text], is_query)?
+            .embeddings
+            .into_iter()
+            .next()
+            .context("empty embedding result")
+    }
+
+    /// Embed a batch of texts, preserving input order.
+    /// is_query: if true, add the query prefix; otherwise the passage prefix.
     pub fn embed_batch(&self, texts: &[&str], is_query: bool) -> Result<EmbedResult> {
         let total_start = std::time::Instant::now();
 
@@ -157,7 +170,7 @@ impl Embedder {
             });
         }
 
-        // Step 1: Add prefixes if needed
+        // Step 1: prefixes
         let prefixed: Vec<String> = if self.config.use_e5_prefix {
             let prefix = if is_query {
                 &self.config.query_prefix
@@ -169,125 +182,93 @@ impl Embedder {
             texts.iter().map(|t| t.to_string()).collect()
         };
 
-        // Step 2: Tokenize in parallel with rayon
+        // Step 2: batch tokenization (tokenizers parallelises internally); no panics.
         let tok_start = std::time::Instant::now();
-        let encodings: Vec<_> = prefixed
-            .par_iter()
-            .map(|text| {
-                let mut tokenizer = self.tokenizer.clone();
-                tokenizer
-                    .with_truncation(Some(tokenizers::TruncationParams {
-                        max_length: self.config.max_length,
-                        ..Default::default()
-                    }))
-                    .unwrap();
-                tokenizer
-                    .with_padding(None)
-                    .unwrap();
-                tokenizer.encode(text.as_str(), true).unwrap()
-            })
-            .collect();
+        let encodings = self
+            .tokenizer
+            .encode_batch(prefixed, true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         let tokenize_us = tok_start.elapsed().as_micros() as u64;
 
-        // Step 3: Sort by length for efficient batching, track original indices
-        let mut indexed: Vec<(usize, &tokenizers::Encoding)> = encodings.iter().enumerate().collect();
-        indexed.sort_by_key(|(_, enc)| enc.get_ids().len());
+        // Step 3: pad to the longest sequence in the batch.
+        let batch_size = encodings.len();
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0)
+            .max(1);
 
-        // Step 4: Dynamic padding and batch construction
-        let batch_size = indexed.len();
-        let max_len = indexed.last().unwrap().1.get_ids().len();
-
-        let mut input_ids = vec![0i64; batch_size * max_len];
+        let mut input_ids = vec![self.pad_id; batch_size * max_len];
         let mut attention_mask = vec![0i64; batch_size * max_len];
         let mut token_type_ids = vec![0i64; batch_size * max_len];
 
-        for (batch_idx, (_, enc)) in indexed.iter().enumerate() {
-            let ids = enc.get_ids();
-            let mask = enc.get_attention_mask();
-            let types = enc.get_type_ids();
-            for (j, &id) in ids.iter().enumerate() {
-                input_ids[batch_idx * max_len + j] = id as i64;
-                attention_mask[batch_idx * max_len + j] = mask[j] as i64;
-                token_type_ids[batch_idx * max_len + j] = types[j] as i64;
+        for (i, enc) in encodings.iter().enumerate() {
+            let base = i * max_len;
+            for (j, &id) in enc.get_ids().iter().enumerate() {
+                input_ids[base + j] = id as i64;
+            }
+            for (j, &m) in enc.get_attention_mask().iter().enumerate() {
+                attention_mask[base + j] = m as i64;
+            }
+            for (j, &t) in enc.get_type_ids().iter().enumerate() {
+                token_type_ids[base + j] = t as i64;
             }
         }
 
-        // Step 5: Run inference
+        // Step 4: inference
         let infer_start = std::time::Instant::now();
-        let embeddings = self.run_inference(
-            &input_ids,
-            &attention_mask,
-            &token_type_ids,
-            batch_size,
-            max_len,
-        )?;
+        let (hidden, dim) =
+            self.run_inference(input_ids, attention_mask.clone(), token_type_ids, batch_size, max_len)?;
         let inference_us = infer_start.elapsed().as_micros() as u64;
 
-        // Step 6: Masked mean pooling + L2 normalize
-        let pooled = self.masked_mean_pool(&embeddings, &attention_mask, batch_size, max_len);
-
-        // Step 7: Restore original order
-        let mut result = vec![vec![0f32; self.embed_dim]; batch_size];
-        for (batch_idx, (orig_idx, _)) in indexed.iter().enumerate() {
-            result[*orig_idx] = pooled[batch_idx].clone();
-        }
-
-        let total_us = total_start.elapsed().as_micros() as u64;
+        // Step 5: masked mean pooling + L2 normalize
+        let embeddings = self.masked_mean_pool(&hidden, &attention_mask, batch_size, max_len, dim);
 
         Ok(EmbedResult {
-            embeddings: result,
+            embeddings,
             tokenize_us,
             inference_us,
-            total_us,
+            total_us: total_start.elapsed().as_micros() as u64,
         })
     }
 
-    /// Run ONNX inference using an available session from the pool
+    /// Run ONNX inference on any free session (blocks until one is available).
+    /// Returns the flattened hidden states and the hidden size.
     fn run_inference(
         &self,
-        input_ids: &[i64],
-        attention_mask: &[i64],
-        token_type_ids: &[i64],
+        input_ids: Vec<i64>,
+        attention_mask: Vec<i64>,
+        token_type_ids: Vec<i64>,
         batch_size: usize,
         seq_len: usize,
-    ) -> Result<Vec<f32>> {
-        // Find an available session
-        let session_guard = self
-            .sessions
-            .iter()
-            .find_map(|s| s.try_lock())
-            .unwrap_or_else(|| self.sessions[0].lock());
+    ) -> Result<(Vec<f32>, usize)> {
+        let guard = self.pool.get()?;
+        let session = guard.session();
 
-        let session = &session_guard.session;
+        let ids_array = ndarray::Array2::from_shape_vec((batch_size, seq_len), input_ids)?;
+        let mask_array = ndarray::Array2::from_shape_vec((batch_size, seq_len), attention_mask)?;
+        let types_array = ndarray::Array2::from_shape_vec((batch_size, seq_len), token_type_ids)?;
 
-        // Create input arrays
-        let ids_array = ndarray::Array2::from_shape_vec(
-            (batch_size, seq_len),
-            input_ids.to_vec(),
-        )?;
-        let mask_array = ndarray::Array2::from_shape_vec(
-            (batch_size, seq_len),
-            attention_mask.to_vec(),
-        )?;
-        let types_array = ndarray::Array2::from_shape_vec(
-            (batch_size, seq_len),
-            token_type_ids.to_vec(),
-        )?;
-
-        // Run the model
         let outputs = session.run(ort::inputs![
             "input_ids" => ids_array.view(),
             "attention_mask" => mask_array.view(),
             "token_type_ids" => types_array.view(),
         ]?)?;
 
-        // Extract output tensor - last_hidden_state is shape [batch, seq, dim]
         let output_tensor = outputs[0]
             .try_extract_tensor::<f32>()
             .context("Failed to extract output tensor")?;
-        
-        let output_view = output_tensor.view();
-        Ok(output_view.iter().copied().collect())
+        let shape = output_tensor.shape().to_vec();
+        anyhow::ensure!(
+            shape.len() == 3 && shape[0] == batch_size && shape[1] == seq_len,
+            "Unexpected output shape {:?}, expected [{}, {}, dim]",
+            shape,
+            batch_size,
+            seq_len
+        );
+        let dim = shape[2];
+        Ok((output_tensor.iter().copied().collect(), dim))
     }
 
     /// Masked mean pooling: average token embeddings weighted by attention mask
@@ -297,8 +278,8 @@ impl Embedder {
         attention_mask: &[i64],
         batch_size: usize,
         seq_len: usize,
+        dim: usize,
     ) -> Vec<Vec<f32>> {
-        let dim = self.embed_dim;
         let mut result = Vec::with_capacity(batch_size);
 
         for i in 0..batch_size {
@@ -309,23 +290,22 @@ impl Embedder {
                 let mask_val = attention_mask[i * seq_len + j] as f32;
                 if mask_val > 0.0 {
                     total_weight += mask_val;
-                    for k in 0..dim {
-                        embedding[k] += hidden_states[i * seq_len * dim + j * dim + k] * mask_val;
+                    let off = (i * seq_len + j) * dim;
+                    for (e, h) in embedding.iter_mut().zip(&hidden_states[off..off + dim]) {
+                        *e += h * mask_val;
                     }
                 }
             }
 
-            // Divide by sum of mask (clamp to avoid div by zero)
             let total_weight = total_weight.max(1e-9);
-            for k in 0..dim {
-                embedding[k] /= total_weight;
+            for e in embedding.iter_mut() {
+                *e /= total_weight;
             }
 
-            // L2 normalize if configured
             if self.config.normalize {
                 let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-                for k in 0..dim {
-                    embedding[k] /= norm;
+                for e in embedding.iter_mut() {
+                    *e /= norm;
                 }
             }
 
@@ -335,8 +315,8 @@ impl Embedder {
         result
     }
 
-    /// Embed with sub-batching for large inputs
-    /// Splits into chunks and distributes across sessions
+    /// Embed a large input by splitting into sub-batches that run concurrently
+    /// across the session pool.
     pub fn embed_batch_parallel(
         self: &Arc<Self>,
         texts: &[&str],
@@ -344,46 +324,44 @@ impl Embedder {
         sub_batch_size: usize,
     ) -> Result<EmbedResult> {
         let total_start = std::time::Instant::now();
+        let sub_batch_size = sub_batch_size.max(1);
 
         if texts.len() <= sub_batch_size {
             return self.embed_batch(texts, is_query);
         }
 
-        // Split into sub-batches
-        let chunks: Vec<&[&str]> = texts.chunks(sub_batch_size).collect();
-        let embedder = Arc::clone(self);
+        let results: Vec<Result<EmbedResult>> = std::thread::scope(|s| {
+            let handles: Vec<_> = texts
+                .chunks(sub_batch_size)
+                .map(|chunk| s.spawn(move || self.embed_batch(chunk, is_query)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("worker panicked"))))
+                .collect()
+        });
 
-        let results: Vec<Result<EmbedResult>> = chunks
-            .par_iter()
-            .map(|chunk| embedder.embed_batch(chunk, is_query))
-            .collect();
-
-        // Merge results
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-        let mut total_tokenize = 0u64;
-        let mut total_inference = 0u64;
-
+        let mut all = Vec::with_capacity(texts.len());
+        let (mut tok, mut inf) = (0u64, 0u64);
         for r in results {
             let r = r?;
-            all_embeddings.extend(r.embeddings);
-            total_tokenize += r.tokenize_us;
-            total_inference += r.inference_us;
+            all.extend(r.embeddings);
+            tok += r.tokenize_us;
+            inf += r.inference_us;
         }
 
-        let total_us = total_start.elapsed().as_micros() as u64;
-
         Ok(EmbedResult {
-            embeddings: all_embeddings,
-            tokenize_us: total_tokenize,
-            inference_us: total_inference,
-            total_us,
+            embeddings: all,
+            tokenize_us: tok,
+            inference_us: inf,
+            total_us: total_start.elapsed().as_micros() as u64,
         })
     }
 }
 
 /// Compute cosine similarity between two vectors
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), b.len());
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();

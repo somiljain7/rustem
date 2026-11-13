@@ -48,7 +48,9 @@ parking_lot = "0.12"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-target-cpu = "native"
+# Note: `target-cpu` is not a Cargo profile key. For a machine-specific build use
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
+# (not portable across CPUs).
 
 [profile.release.build-override]
 opt-level = 3

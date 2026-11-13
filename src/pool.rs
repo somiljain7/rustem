@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use ort::session::{Session, builder::GraphOptimizationLevel};
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use tracing::{debug, info};
 
 /// A managed ONNX session with tracking metadata.

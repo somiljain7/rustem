@@ -1,17 +1,15 @@
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
 
 /// Thread-safe LRU embedding cache.
 ///
-/// Key: hash of `(text, is_query)` — avoids storing full text strings in memory.
-/// Value: `Vec<f32>` embedding vector.
+/// Key: the full `(is_query, text)` pair, so hash collisions can never return
+/// another text's embedding. Value: the embedding vector.
 pub struct EmbeddingCache {
-    inner: Mutex<LruCache<u64, Vec<f32>>>,
+    inner: Mutex<LruCache<String, Vec<f32>>>,
     hits: AtomicU64,
     misses: AtomicU64,
     capacity: usize,
@@ -41,12 +39,11 @@ impl EmbeddingCache {
         }
     }
 
-    /// Compute a deterministic hash key for `(text, is_query)`.
-    fn cache_key(text: &str, is_query: bool) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        is_query.hash(&mut hasher);
-        hasher.finish()
+    fn cache_key(text: &str, is_query: bool) -> String {
+        let mut k = String::with_capacity(text.len() + 1);
+        k.push(if is_query { 'q' } else { 'p' });
+        k.push_str(text);
+        k
     }
 
     /// Look up a cached embedding. Returns `Some(embedding)` on hit, `None` on miss.
@@ -68,15 +65,13 @@ impl EmbeddingCache {
     /// Insert an embedding into the cache.
     pub fn put(&self, text: &str, is_query: bool, embedding: Vec<f32>) {
         let key = Self::cache_key(text, is_query);
-        let mut cache = self.inner.lock();
-        cache.put(key, embedding);
+        self.inner.lock().put(key, embedding);
     }
 
     /// Check if a text is cached without updating LRU order.
     pub fn contains(&self, text: &str, is_query: bool) -> bool {
         let key = Self::cache_key(text, is_query);
-        let cache = self.inner.lock();
-        cache.contains(&key)
+        self.inner.lock().contains(&key)
     }
 
     /// Current number of entries in the cache.
@@ -106,11 +101,7 @@ impl EmbeddingCache {
             size: self.len(),
             hits,
             misses,
-            hit_rate: if total > 0 {
-                hits as f64 / total as f64
-            } else {
-                0.0
-            },
+            hit_rate: if total > 0 { hits as f64 / total as f64 } else { 0.0 },
         }
     }
 }
@@ -146,5 +137,14 @@ mod tests {
         assert!(cache.get("a", true).is_none());
         assert!(cache.get("b", true).is_some());
         assert!(cache.get("c", true).is_some());
+    }
+
+    #[test]
+    fn test_query_passage_keys_do_not_collide() {
+        let cache = EmbeddingCache::new(4);
+        cache.put("qx", false, vec![1.0]);
+        // "x" as query must not alias "qx" as passage.
+        assert!(cache.get("x", true).is_none());
+        assert!(cache.get("qx", false).is_some());
     }
 }

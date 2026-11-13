@@ -42,12 +42,12 @@ struct Cli {
 enum Commands {
     /// Embed texts from stdin or --texts argument, output JSON
     Embed {
-        /// Texts to embed (comma-separated). If omitted, reads from stdin (one per line).
-        #[arg(long)]
-        texts: Option<String>,
+        /// Text to embed; repeat for several. If omitted, reads stdin (one per line).
+        #[arg(long = "text")]
+        texts: Vec<String>,
 
-        /// Treat texts as queries (adds "query: " prefix)
-        #[arg(long, default_value_t = true)]
+        /// Treat texts as queries ("query: " prefix); pass `--is-query false` for passages
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         is_query: bool,
     },
 
@@ -64,12 +64,16 @@ enum Commands {
         /// Number of warmup iterations
         #[arg(long, default_value_t = 5)]
         warmup: usize,
+
+        /// Concurrent client threads (use >= --sessions to exercise the session pool)
+        #[arg(long, default_value_t = 1)]
+        clients: usize,
     },
 
     /// Start HTTP server
     Serve {
         /// Bind address
-        #[arg(long, default_value = "0.0.0.0")]
+        #[arg(long, default_value = "127.0.0.1")]
         bind: String,
 
         /// Port
@@ -119,12 +123,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Embed { texts, is_query } => cmd_embed(&cli, texts.as_deref(), *is_query),
+        Commands::Embed { texts, is_query } => cmd_embed(&cli, texts, *is_query),
         Commands::Bench {
             batch_sizes,
             iterations,
             warmup,
-        } => cmd_bench(&cli, batch_sizes, *iterations, *warmup),
+            clients,
+        } => cmd_bench(&cli, batch_sizes, *iterations, *warmup, *clients),
         Commands::Serve {
             bind,
             port,
@@ -145,12 +150,12 @@ fn main() -> Result<()> {
 
 // ── embed ─────────────────────────────────────────────────────────────────
 
-fn cmd_embed(cli: &Cli, texts_arg: Option<&str>, is_query: bool) -> Result<()> {
+fn cmd_embed(cli: &Cli, texts_arg: &[String], is_query: bool) -> Result<()> {
     let config = build_embedder_config(cli);
     let embedder = Embedder::new(config)?;
 
-    let texts: Vec<String> = if let Some(t) = texts_arg {
-        t.split(',').map(|s| s.trim().to_string()).collect()
+    let texts: Vec<String> = if !texts_arg.is_empty() {
+        texts_arg.to_vec()
     } else {
         info!("Reading texts from stdin (one per line, Ctrl+D / Ctrl+Z to finish)...");
         let stdin = io::stdin();
@@ -185,19 +190,27 @@ fn cmd_embed(cli: &Cli, texts_arg: Option<&str>, is_query: bool) -> Result<()> {
 
 // ── bench ─────────────────────────────────────────────────────────────────
 
-fn cmd_bench(cli: &Cli, batch_sizes_str: &str, iterations: usize, warmup: usize) -> Result<()> {
+fn cmd_bench(
+    cli: &Cli,
+    batch_sizes_str: &str,
+    iterations: usize,
+    warmup: usize,
+    clients: usize,
+) -> Result<()> {
     let config = build_embedder_config(cli);
     let embedder = Arc::new(Embedder::new(config)?);
+    let clients = clients.max(1);
 
+    // Raw texts: the embedder adds the "query: " prefix itself.
     let test_texts: Vec<&str> = vec![
-        "query: I want to order pizza",
-        "query: मुझे पिज़्ज़ा ऑर्डर करना है",
-        "query: mujhe pizza order karna hai",
-        "query: What is the weather today?",
-        "query: आज मौसम कैसा है?",
-        "query: play some music",
-        "query: set an alarm for 7am",
-        "query: book a cab to airport",
+        "I want to order pizza",
+        "मुझे पिज़्ज़ा ऑर्डर करना है",
+        "mujhe pizza order karna hai",
+        "What is the weather today?",
+        "आज मौसम कैसा है?",
+        "play some music",
+        "set an alarm for 7am",
+        "book a cab to airport",
     ];
 
     let batch_sizes: Vec<usize> = batch_sizes_str
@@ -235,21 +248,41 @@ fn cmd_bench(cli: &Cli, batch_sizes_str: &str, iterations: usize, warmup: usize)
             let _ = embedder.embed_batch(&batch, true)?;
         }
 
-        // Timed runs
+        // Timed runs: `clients` concurrent threads, each doing `iterations` calls.
         let mut hist =
             Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("histogram creation");
-        let mut total_texts = 0usize;
         let overall_start = Instant::now();
 
-        for _ in 0..iterations {
-            let start = Instant::now();
-            let _ = embedder.embed_batch(&batch, true)?;
-            let elapsed_us = start.elapsed().as_micros() as u64;
-            hist.record(elapsed_us).ok();
-            total_texts += batch_size;
-        }
+        let per_client: Vec<Result<Vec<u64>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..clients)
+                .map(|_| {
+                    let embedder = &embedder;
+                    let batch = &batch;
+                    s.spawn(move || -> Result<Vec<u64>> {
+                        let mut lat = Vec::with_capacity(iterations);
+                        for _ in 0..iterations {
+                            let start = Instant::now();
+                            embedder.embed_batch(batch, true)?;
+                            lat.push(start.elapsed().as_micros() as u64);
+                        }
+                        Ok(lat)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("client panicked"))))
+                .collect()
+        });
 
         let overall_elapsed_s = overall_start.elapsed().as_secs_f64();
+        let mut total_texts = 0usize;
+        for lat in per_client {
+            for us in lat? {
+                hist.record(us.max(1)).ok();
+                total_texts += batch_size;
+            }
+        }
         let throughput = total_texts as f64 / overall_elapsed_s;
 
         let p50 = hist.value_at_percentile(50.0) as f64 / 1000.0;
@@ -351,6 +384,7 @@ fn cmd_eval(cli: &Cli, reference_path: &str) -> Result<()> {
         println!("| {} | {} | {:.6} |", i + 1, text_preview, sim);
     }
 
+    anyhow::ensure!(!ref_data.texts.is_empty(), "Reference file is empty");
     let n = ref_data.texts.len() as f64;
     let avg_sim = total_sim / n;
 
