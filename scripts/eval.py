@@ -233,7 +233,9 @@ def evaluate_retrieval(embedder_fp32, embedder_int8, utterances):
                 recall_5 += 1
 
             # First rank index (1-based)
-            first_hit = next(rank for rank, hit in enumerate(matches, 1) if hit)
+            first_hit = next((rank for rank, hit in enumerate(matches, 1) if hit), None)
+            if first_hit is None:  # intent has a single utterance: no positive to retrieve
+                continue
             reciprocal_ranks.append(1.0 / first_hit)
 
         r1 = recall_1 / n

@@ -215,6 +215,8 @@ def verify_onnx(fp32_path: Path, int8_path: Path, tokenizer) -> None:
         )
         label = text[:50]
         print(f"       {label:50s} fp32↔int8 cos_sim = {cos_sim:.6f}")
+        if cos_sim < 0.98:
+            raise SystemExit(f"INT8 fidelity too low ({cos_sim:.4f}) for: {label}")
 
     # Cross-lingual: pizza texts should be similar
     cos_en_hi = np.dot(fp32_emb[0], fp32_emb[1]) / (
@@ -228,8 +230,9 @@ def main() -> None:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fp32_path = output_dir / "model_fp32.onnx"
-    int8_path = output_dir / "model_int8.onnx"
+    # Filenames match what the Rust service and eval.py expect by default.
+    fp32_path = output_dir / "model.onnx"
+    int8_path = output_dir / "model_quantized.onnx"
 
     # Step 1: Download
     model, tokenizer = download_model(args.model_name)
