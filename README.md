@@ -59,6 +59,8 @@ python scripts/eval.py
 python scripts/benchmark_python.py --iterations 1000
 ```
 
+> **Windows users:** read `BUILD_NOTES.md` first. You need Smart App Control off (or build in WSL2), MinGW on PATH for the `windows-gnu` toolchain, and `ORT_DYLIB_PATH` pointing at an ONNX Runtime 1.20.x `onnxruntime.dll` because `ort` is built with `load-dynamic`. Set `RUST_LOG=error` if you parse the CLI's JSON output, since logs go to stdout.
+
 ### 4. Run Rust Embedder Service
 ```bash
 # Start HTTP service

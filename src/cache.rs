@@ -31,11 +31,13 @@ impl EmbeddingCache {
         info!("Embedding cache initialized: capacity={}", capacity);
         Self {
             inner: Mutex::new(LruCache::new(
-                NonZeroUsize::new(capacity).expect("Cache capacity must be > 0"),
+                // Capacity 0 is clamped to 1 instead of panicking; callers that
+                // want "no cache" should simply not construct one.
+                NonZeroUsize::new(capacity.max(1)).expect("capacity clamped to >= 1"),
             )),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
-            capacity,
+            capacity: capacity.max(1),
         }
     }
 

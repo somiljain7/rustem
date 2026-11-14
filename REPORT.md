@@ -125,3 +125,16 @@ The semantic embedding spaces of all three models on the same multilingual inten
 * **Multi-Engine Comprehensive Benchmark:** `scripts/benchmark_all_comprehensive.py`
 * **Quality & Heatmap Suite:** `scripts/eval.py`
 * **Multilingual Intent Dataset (202 examples):** `data/test_utterances.json`
+* **Build notes, issues & run checklist:** `BUILD_NOTES.md`
+
+---
+
+## 9. Rust Service Verification Update (2026-11-15)
+
+A code review of the Rust service was followed by a real build and run on the same i5-9300H (Windows, `windows-gnu` toolchain). Full details, issues and fixes are in `BUILD_NOTES.md`.
+
+* **Build:** after the review fixes (missing `ServerConfig.limits`, `ort` rc.9 API mismatches, unbounded parallel threads, timeouts still consuming CPU), `cargo check --all-targets` and `cargo test --lib` pass.
+* **Service:** `/health`, `/embed` and `/embed/single` verified; oversize requests return HTTP 400; duplicate texts are embedded once and returned in order.
+* **Fidelity (INT8 vs FP32, same Rust pipeline, 202 utterances):** mean cosine `0.9967`, min `0.9904`, max `0.9983`.
+* **Latency (4 sessions × 2 threads, 1 client, MinGW build, 30 iterations):** batch 1 p50 `6.96 ms`, batch 8 `48.67 ms`, batch 64 `322.56 ms`. This is slower than the `5.15 ms` headline above; the cause was not isolated (build toolchain, background load and thermals are candidates), so re-measure on an idle machine before quoting it.
+* **Concurrency:** 4 clients raise batch-1 throughput from `136` to `284` texts/s but push p95 to about `30 ms` because 4 clients × 2 threads oversubscribe 4 cores.

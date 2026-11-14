@@ -1,6 +1,4 @@
 use anyhow::{Context, Result};
-use ort::session::builder::GraphOptimizationLevel;
-use std::sync::Arc;
 use tokenizers::{Tokenizer, TruncationParams};
 use tracing::info;
 
@@ -101,7 +99,6 @@ impl Embedder {
             model_path: config.model_path.clone(),
             num_sessions: config.num_sessions,
             intra_threads: config.intra_threads,
-            optimization_level: GraphOptimizationLevel::Level3,
         })?;
 
         let mut embedder = Self {
@@ -318,7 +315,7 @@ impl Embedder {
     /// Embed a large input by splitting into sub-batches that run concurrently
     /// across the session pool.
     pub fn embed_batch_parallel(
-        self: &Arc<Self>,
+        &self,
         texts: &[&str],
         is_query: bool,
         sub_batch_size: usize,
@@ -330,16 +327,22 @@ impl Embedder {
             return self.embed_batch(texts, is_query);
         }
 
-        let results: Vec<Result<EmbedResult>> = std::thread::scope(|s| {
-            let handles: Vec<_> = texts
-                .chunks(sub_batch_size)
-                .map(|chunk| s.spawn(move || self.embed_batch(chunk, is_query)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("worker panicked"))))
-                .collect()
-        });
+        // Run in waves of at most `num_sessions` threads (one per ONNX session).
+        let chunks: Vec<&[&str]> = texts.chunks(sub_batch_size).collect();
+        let mut results: Vec<Result<EmbedResult>> = Vec::with_capacity(chunks.len());
+        for wave in chunks.chunks(self.config.num_sessions.max(1)) {
+            let wave_results: Vec<Result<EmbedResult>> = std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|chunk| s.spawn(move || self.embed_batch(chunk, is_query)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("worker panicked"))))
+                    .collect()
+            });
+            results.extend(wave_results);
+        }
 
         let mut all = Vec::with_capacity(texts.len());
         let (mut tok, mut inf) = (0u64, 0u64);
@@ -361,7 +364,7 @@ impl Embedder {
 
 /// Compute cosine similarity between two vectors
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "cosine_similarity: dimension mismatch");
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();

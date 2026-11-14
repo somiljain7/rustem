@@ -6,13 +6,14 @@ description = "CPU-optimized multilingual text embedding service using ONNX Runt
 
 [dependencies]
 # ONNX Runtime - pinned to exact version
-ort = { version = "=2.0.0-rc.9", features = ["load-dynamic"] }
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
+# Keep ort-sys on the same release as ort (it otherwise floats to rc.10).
+ort-sys = "=2.0.0-rc.9"
 
 # Tokenization
 tokenizers = { version = "=0.21.1", features = [] }
 
 # Parallelism
-rayon = "1.10"
 crossbeam-channel = "0.5"
 
 # Async / server

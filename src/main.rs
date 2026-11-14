@@ -7,7 +7,6 @@ use std::time::Instant;
 use tracing::info;
 
 use embed_service::batcher::BatcherConfig;
-use embed_service::cache::EmbeddingCache;
 use embed_service::embedder::{cosine_similarity, Embedder, EmbedderConfig};
 use embed_service::server::{self, ServerConfig};
 
@@ -321,6 +320,7 @@ fn cmd_serve(
             max_wait_ms,
             ..Default::default()
         },
+        ..Default::default()
     };
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -371,6 +371,13 @@ fn cmd_eval(cli: &Cli, reference_path: &str) -> Result<()> {
         .zip(ref_data.embeddings.iter())
         .enumerate()
     {
+        anyhow::ensure!(
+            computed.len() == reference.len(),
+            "Dimension mismatch at row {}: computed {} vs reference {}",
+            i + 1,
+            computed.len(),
+            reference.len()
+        );
         let sim = cosine_similarity(computed, reference) as f64;
         total_sim += sim;
         if sim < min_sim {

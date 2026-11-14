@@ -176,9 +176,16 @@ impl DynamicBatcher {
     async fn process_group(
         embedder: &Arc<Embedder>,
         cache: &Option<Arc<EmbeddingCache>>,
-        group: Vec<EmbedRequest>,
+        mut group: Vec<EmbedRequest>,
         is_query: bool,
     ) {
+        // Drop requests whose client already gave up (timeout/disconnect) so we
+        // don't burn CPU on results nobody will read.
+        group.retain(|r| !r.response_tx.is_closed());
+        if group.is_empty() {
+            return;
+        }
+
         // unique text -> embedding
         let mut resolved: HashMap<String, Vec<f32>> = HashMap::new();
         let mut to_compute: Vec<String> = Vec::new();

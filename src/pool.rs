@@ -19,8 +19,6 @@ pub struct PoolConfig {
     pub num_sessions: usize,
     /// Intra-op threads per session (controls parallelism within a single op).
     pub intra_threads: usize,
-    /// Graph optimization level.
-    pub optimization_level: GraphOptimizationLevel,
 }
 
 impl Default for PoolConfig {
@@ -29,7 +27,6 @@ impl Default for PoolConfig {
             model_path: "models/model_quantized.onnx".to_string(),
             num_sessions: 4,
             intra_threads: 2,
-            optimization_level: GraphOptimizationLevel::Level3,
         }
     }
 }
@@ -92,8 +89,8 @@ impl SessionPool {
 
         for i in 0..config.num_sessions {
             let session = Session::builder()?
-                .with_optimization_level(config.optimization_level)?
-                .with_intra_threads(config.intra_threads as u16)?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(config.intra_threads)?
                 .with_inter_threads(1)?
                 .commit_from_file(&config.model_path)
                 .with_context(|| format!("Failed to create pooled session {}", i))?;
