@@ -8,6 +8,7 @@ use tracing::info;
 
 use embed_service::batcher::BatcherConfig;
 use embed_service::embedder::{cosine_similarity, Embedder, EmbedderConfig};
+use embed_service::pool::Backend;
 use embed_service::server::{self, ServerConfig};
 
 #[derive(Parser)]
@@ -35,6 +36,39 @@ struct Cli {
     /// Maximum sequence length
     #[arg(long, default_value_t = 128)]
     max_length: usize,
+
+    /// Inference backend. `openvino` needs an OpenVINO-enabled onnxruntime (see ORT_DYLIB_PATH)
+    #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
+    backend: BackendArg,
+
+    /// Prompt prefixes for the model family: e5 ("query: "), gemma ("task: search result | query: "), none
+    #[arg(long, value_enum, default_value_t = PrefixStyle::E5)]
+    prefix_style: PrefixStyle,
+
+    /// Matryoshka truncation: keep the first N dims before normalizing (0 = off)
+    #[arg(long, default_value_t = 0)]
+    truncate_dim: usize,
+
+    /// OpenVINO device type: CPU, GPU or NPU (only used with --backend openvino)
+    #[arg(long, default_value = "CPU")]
+    ov_device: String,
+
+    /// OpenVINO compiled-model cache directory (only used with --backend openvino)
+    #[arg(long)]
+    ov_cache_dir: Option<String>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PrefixStyle {
+    E5,
+    Gemma,
+    None,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Openvino,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +141,22 @@ fn build_embedder_config(cli: &Cli) -> EmbedderConfig {
         num_sessions: cli.sessions,
         intra_threads: cli.threads,
         max_length: cli.max_length,
+        backend: match cli.backend {
+            BackendArg::Cpu => Backend::Cpu,
+            BackendArg::Openvino => Backend::OpenVino,
+        },
+        ov_device: cli.ov_device.clone(),
+        ov_cache_dir: cli.ov_cache_dir.clone(),
+        truncate_dim: cli.truncate_dim,
+        use_e5_prefix: !matches!(cli.prefix_style, PrefixStyle::None),
+        query_prefix: match cli.prefix_style {
+            PrefixStyle::Gemma => "task: search result | query: ".to_string(),
+            _ => "query: ".to_string(),
+        },
+        passage_prefix: match cli.prefix_style {
+            PrefixStyle::Gemma => "title: none | text: ".to_string(),
+            _ => "passage: ".to_string(),
+        },
         ..Default::default()
     }
 }
@@ -224,8 +274,14 @@ fn cmd_bench(
         iterations, warmup
     );
     eprintln!(
-        "   Model: {}, Sessions: {}, Threads/session: {}",
-        cli.model, cli.sessions, cli.threads
+        "   Model: {}, Sessions: {}, Threads/session: {}, Backend: {}",
+        cli.model,
+        cli.sessions,
+        cli.threads,
+        match cli.backend {
+            BackendArg::Cpu => "cpu",
+            BackendArg::Openvino => "openvino",
+        }
     );
     eprintln!();
 

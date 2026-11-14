@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
+use ort::execution_providers::{ExecutionProvider, OpenVINOExecutionProvider};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, info};
@@ -8,6 +9,17 @@ use tracing::{debug, info};
 struct PooledSession {
     session: Session,
     id: usize,
+}
+
+/// Inference backend used by every pooled session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// Stock ONNX Runtime CPU execution provider.
+    #[default]
+    Cpu,
+    /// OpenVINO execution provider. Requires an ONNX Runtime build with OpenVINO
+    /// support (e.g. the `onnxruntime-openvino` package) loaded via `ORT_DYLIB_PATH`.
+    OpenVino,
 }
 
 /// Configuration for the session pool.
@@ -19,6 +31,12 @@ pub struct PoolConfig {
     pub num_sessions: usize,
     /// Intra-op threads per session (controls parallelism within a single op).
     pub intra_threads: usize,
+    /// Which backend to run the sessions on.
+    pub backend: Backend,
+    /// OpenVINO device type, e.g. "CPU", "GPU", "NPU" (ignored for `Backend::Cpu`).
+    pub ov_device: String,
+    /// Optional OpenVINO compiled-model cache directory (ignored for `Backend::Cpu`).
+    pub ov_cache_dir: Option<String>,
 }
 
 impl Default for PoolConfig {
@@ -27,6 +45,9 @@ impl Default for PoolConfig {
             model_path: "models/model_quantized.onnx".to_string(),
             num_sessions: 4,
             intra_threads: 2,
+            backend: Backend::Cpu,
+            ov_device: "CPU".to_string(),
+            ov_cache_dir: None,
         }
     }
 }
@@ -79,8 +100,8 @@ impl SessionPool {
     /// CPUs with limited cores.
     pub fn new(config: &PoolConfig) -> Result<Self> {
         info!(
-            "Creating session pool: {} sessions × {} intra-threads",
-            config.num_sessions, config.intra_threads
+            "Creating session pool: {} sessions × {} intra-threads, backend={:?}",
+            config.num_sessions, config.intra_threads, config.backend
         );
 
         // Bounded channel with capacity == num_sessions ensures we never exceed
@@ -88,10 +109,31 @@ impl SessionPool {
         let (sender, receiver) = crossbeam_channel::bounded(config.num_sessions);
 
         for i in 0..config.num_sessions {
-            let session = Session::builder()?
+            let mut builder = Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
                 .with_intra_threads(config.intra_threads)?
-                .with_inter_threads(1)?
+                .with_inter_threads(1)?;
+
+            if config.backend == Backend::OpenVino {
+                let mut ep = OpenVINOExecutionProvider::default()
+                    .with_device_type(&config.ov_device)
+                    .with_num_threads(config.intra_threads)
+                    // Batch size and sequence length vary per request.
+                    .with_dynamic_shapes();
+                if let Some(dir) = &config.ov_cache_dir {
+                    ep = ep.with_cache_dir(dir);
+                }
+                // Fail loudly instead of silently falling back to plain CPU, which
+                // would make benchmark numbers misleading.
+                anyhow::ensure!(
+                    ep.is_available().unwrap_or(false),
+                    "OpenVINO execution provider is not available in the loaded ONNX Runtime. \
+                     Point ORT_DYLIB_PATH at an OpenVINO-enabled onnxruntime build."
+                );
+                builder = builder.with_execution_providers([ep.build().error_on_failure()])?;
+            }
+
+            let session = builder
                 .commit_from_file(&config.model_path)
                 .with_context(|| format!("Failed to create pooled session {}", i))?;
 

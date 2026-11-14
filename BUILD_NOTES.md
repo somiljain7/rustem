@@ -83,3 +83,47 @@ Notes on these numbers:
 - The FP32 reference was produced by this same Rust pipeline, so `eval` measures quantization loss only, not tokenizer or pooling correctness against the Python reference.
 - Logs go to stdout (issue 8); switching tracing to stderr is a one-line change not yet made.
 - `scripts/*.py` and `benches/throughput.rs` were not run (benches only compile-checked).
+
+## 6. OpenVINO backend and EmbeddingGemma (added 2026-11-15)
+
+### What was added
+- `--backend cpu|openvino`, `--ov-device CPU|GPU|NPU`, `--ov-cache-dir` (all subcommands). The OpenVINO execution provider registers through `ort`'s existing `load-dynamic` feature, so no new Cargo feature is needed. If the loaded ONNX Runtime has no OpenVINO support, startup fails with a clear error instead of silently running on plain CPU.
+- The embedder now adapts to the model: it sends `token_type_ids` only if the model declares it, uses a pooled `sentence_embedding` output when present (else masked mean pooling), and supports `--prefix-style e5|gemma|none` and `--truncate-dim N` (Matryoshka).
+- Gemma example:
+  ```powershell
+  embed-service --model models/gemma/model_quantized.onnx --tokenizer models/gemma/tokenizer.json `
+    --prefix-style gemma --sessions 1 --threads 4 --backend openvino embed
+  ```
+
+### Runtime pairings tested (the ONNX Runtime and OpenVINO versions must match)
+Install each in its own venv; point `ORT_DYLIB_PATH` at that venv's `onnxruntime\capi\onnxruntime.dll` and put its `openvino\libs` and `onnxruntime\capi` folders on `PATH`.
+
+| ONNX Runtime | OpenVINO | Result |
+|---|---|---|
+| `onnxruntime` 1.20.1 (CPU) | none | Works. Baseline |
+| `onnxruntime-openvino` 1.20.0 | `openvino==2024.4.0` | Works, **no speedup** (provider leaves the fused Gemma ops on CPU) |
+| `onnxruntime-openvino` 1.24.1 | `openvino==2026.4.1` | **Fails**: `Error 127 procedure not found` loading the provider DLL (ABI mismatch) |
+| `onnxruntime-openvino` 1.24.1 | `openvino==2025.4.1` | Works, about 2.2x faster at batch 1. `ort` rc.9 warns it expects 1.20.x but the legacy provider call still works |
+
+### Gemma results (quantized INT8, 1 session x 4 threads, 30 iterations, i5-9300H)
+
+| Path | batch 1 p50 | batch 8 p50 | batch 16 p50 |
+|---|---:|---:|---:|
+| ORT 1.20.1, CPU provider | 168.96 ms | 345.60 ms | 531.97 ms |
+| ORT-OpenVINO 1.20.0 + OV 2024.4 | 163.20 ms | 360.19 ms | 579.58 ms |
+| ORT-OpenVINO 1.24.1 + OV 2025.4.1 | **75.58 ms** | 300.54 ms | 573.44 ms |
+| Native `openvino.Core` 2026.4.1 (Python probe, fixed seq 24, no tokenizer) | **39.4 ms** | 295.0 ms | 590.0 ms |
+
+- Embeddings were identical across CPU and OpenVINO runs on the sample (English pizza vs Hinglish pizza cosine 0.9192, vs weather 0.2440).
+- The report's 37.99 ms is reproduced only by **native OpenVINO 2026**, not by the ONNX Runtime provider. OpenVINO 2024.4's ONNX frontend cannot even read this file: it lacks `SimplifiedLayerNormalization`, `com.microsoft.RotaryEmbedding` and `com.microsoft.MultiHeadAttention`.
+- The advantage is a **batch-1 latency** win only. At batch 8 and 16 every path is within noise of plain CPU (compute-bound), so OpenVINO does not help throughput here.
+- Reaching about 39 ms inside the Rust service would need the native OpenVINO API (for example the `openvino` crate or the C API), a bigger change than the provider backend. Not done.
+- The native probe used fixed token ids, so it measures forward-pass time only. Tokenization and pooling are excluded.
+
+### New issues faced
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| 12 | `unexpected argument 'want'` | `Start-Process -ArgumentList` splits strings with spaces | Feed texts through stdin from a UTF-8 file |
+| 13 | OpenVINO provider loads but gives no speedup | Provider cannot offload ORT-specific fused ops | Use a newer matching pairing (table above) or native OpenVINO |
+| 14 | `onnxruntime_providers_openvino.dll` Error 127 | ONNX Runtime and OpenVINO versions do not match | Pair 1.20.0 with 2024.4, 1.24.1 with 2025.4.1 |
+| 15 | `ort` rc.9 warns about ONNX Runtime 1.24.1 | `ort` rc.9 targets 1.20 | Works for the OpenVINO provider call used here, but untested more broadly |
