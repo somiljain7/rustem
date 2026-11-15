@@ -135,6 +135,39 @@ Install each in its own venv; point `ORT_DYLIB_PATH` at that venv's `onnxruntime
 | # | Symptom | Cause | Fix |
 |---|---|---|---|
 | 12 | `unexpected argument 'want'` | `Start-Process -ArgumentList` splits strings with spaces | Feed texts through stdin from a UTF-8 file |
-| 13 | OpenVINO provider loads but gives no speedup | Provider cannot offload ORT-specific fused ops | Use a newer matching pairing (table above) or native OpenVINO |
+| 13 | OpenVINO provider loads but gives no speedup | Partly unsupported fused ops; the main cause turned out to be per-call weight dequantization (section 7) | Pre-dequantize the weights (section 7), or use a newer matching pairing (table above) or native OpenVINO |
 | 14 | `onnxruntime_providers_openvino.dll` Error 127 | ONNX Runtime and OpenVINO versions do not match | Pair 1.20.0 with 2024.4, 1.24.1 with 2025.4.1 |
 | 15 | `ort` rc.9 warns about ONNX Runtime 1.24.1 | `ort` rc.9 targets 1.20 | Works for the OpenVINO provider call used here, but untested more broadly |
+
+## 7. Why Gemma is slow in ONNX Runtime, and the fix (experiments, 2026-11-15)
+
+Question: why is Gemma INT8 on ONNX Runtime CPU ~170 ms at batch 1 while native OpenVINO takes ~35 ms, and is the language (Rust vs Python) or the ABI to blame? All runs: Gemma INT8, 1 session x 4 threads, i5-9300H, idle machine. Scripts are in `scripts/experiments/` and `scripts/fold_dequantize.py`.
+
+| # | Experiment | Result | Conclusion |
+|---|---|---|---|
+| 1 | Rust vs Python, same model, tokenizer, prefix, ORT settings (2 rounds, 100 iterations) | Batch 1: Rust 158.1 / 160.8 ms, Python 160.5 / 155.9 ms. Batch 16: Rust 494.9 / 502.1, Python 495.7 / 496.9. In both, inference is more than 99.8% of the time (tokenize ~0.1 ms, rest ~0.1 ms) | **Language and ABI do not matter**; no consistent winner |
+| 2 | Latency vs tokens sweep (batch 1 to 32, seq 8 to 128), linear fit | ORT CPU: **144.8 ms fixed + 1298 us/token**. Native OpenVINO 2026: **-1.9 ms fixed + 1302 us/token** | Per-token speed is identical (0.3%); the whole difference is a ~145 ms fixed cost that ORT pays on every call |
+| 3 | ORT per-operator profile (batch 1 and 16, seq 24) | `DequantizeLinear` = 176.6 ms/run at batch 1 (62%) and 171.4 ms/run at batch 16. `MatMul` runs in fp32 | The fixed cost is ORT converting the INT8 weights to fp32 on **every** call. The "INT8" file only saves disk space, not compute |
+| 4 | Config sweep (threads, hints, spinning) | OpenVINO: 4 vs 8 threads no change; THROUGHPUT hint worse (717 vs 500 ms at batch 16). ORT: 4 threads best, 8 and 2 slower | Not a tuning problem; 4 physical cores are the limit |
+| 5 | Achievable fp32 matrix multiply (numpy/OpenBLAS, 4 threads) | About 200 GFLOPS (113 at 24 tokens) | Real ceiling is about half the ~450 GFLOPS spec-sheet figure; both engines sit near it |
+| 6 | **Intervention:** fold the 175 `DequantizeLinear` nodes into fp32 weights once, offline (`scripts/fold_dequantize.py`), run in the Rust service on plain ORT CPU | Batch 1 p50: **171.2 / 147.2 ms -> 34.3 / 34.4 ms**. Batch 16: 496.1 / 479.5 -> 363.0 / 351.2 ms. Embeddings identical (cosine 1.000000) | **Confirms the cause.** Plain ORT now matches native OpenVINO (~35 to 39 ms) with no OpenVINO |
+
+### The fix
+```powershell
+python scripts/fold_dequantize.py models/gemma/model_quantized.onnx models/gemma_fp32w
+embed-service --model models/gemma_fp32w/model_fp32w.onnx --tokenizer models/gemma/tokenizer.json `
+  --prefix-style gemma --sessions 1 --threads 4 serve
+```
+Trade-off: the converted model is 1.18 GB on disk (vs 295 MB) and uses that much more memory. It needs `pip install onnx numpy`. The output folder is git-ignored.
+
+### Corrections to earlier statements in these notes and the report
+- "INT8 math on AVX2 without VNNI" does not apply to this Gemma file: its weights are stored as INT8 but multiplied in fp32.
+- The OpenVINO speedup in `REPORT.md` section 3 was measured against ONNX Runtime paying the per-call dequantization cost. Most of the "6.4x" is that avoidable fixed cost, not OpenVINO kernels.
+- The fixed cost is the same at every batch size, so the pre-dequantized model helps most for short, single requests.
+- At batch 16 the improvement is about 27% (496 -> 363 ms), because the matrix math dominates there.
+- Caveat: I did not check whether e5-small (the default model) has the same pattern; its INT8 file is a different export and was not profiled.
+
+### Not done
+- Exact FLOP count from the graph (the per-token cost was only compared between engines).
+- Padding experiment and the full Gemma quality eval on the converted model (fidelity checked on 3 sentences only).
+- oneDNN built into ONNX Runtime (no evidence it would help: ORT and OpenVINO already match per token).

@@ -308,17 +308,22 @@ fn cmd_bench(
             Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("histogram creation");
         let overall_start = Instant::now();
 
-        let per_client: Vec<Result<Vec<u64>>> = std::thread::scope(|s| {
+        // Each sample: (total_us, tokenize_us, inference_us)
+        let per_client: Vec<Result<Vec<(u64, u64, u64)>>> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..clients)
                 .map(|_| {
                     let embedder = &embedder;
                     let batch = &batch;
-                    s.spawn(move || -> Result<Vec<u64>> {
+                    s.spawn(move || -> Result<Vec<(u64, u64, u64)>> {
                         let mut lat = Vec::with_capacity(iterations);
                         for _ in 0..iterations {
                             let start = Instant::now();
-                            embedder.embed_batch(batch, true)?;
-                            lat.push(start.elapsed().as_micros() as u64);
+                            let r = embedder.embed_batch(batch, true)?;
+                            lat.push((
+                                start.elapsed().as_micros() as u64,
+                                r.tokenize_us,
+                                r.inference_us,
+                            ));
                         }
                         Ok(lat)
                     })
@@ -332,12 +337,29 @@ fn cmd_bench(
 
         let overall_elapsed_s = overall_start.elapsed().as_secs_f64();
         let mut total_texts = 0usize;
+        let (mut tok_v, mut inf_v, mut tot_v) = (Vec::new(), Vec::new(), Vec::new());
         for lat in per_client {
-            for us in lat? {
+            for (us, tok, inf) in lat? {
                 hist.record(us.max(1)).ok();
+                tot_v.push(us);
+                tok_v.push(tok);
+                inf_v.push(inf);
                 total_texts += batch_size;
             }
         }
+        let med = |v: &mut Vec<u64>| -> f64 {
+            v.sort_unstable();
+            v.get(v.len() / 2).copied().unwrap_or(0) as f64 / 1000.0
+        };
+        let (m_tot, m_tok, m_inf) = (med(&mut tot_v), med(&mut tok_v), med(&mut inf_v));
+        eprintln!(
+            "   batch {:>3}: p50 total {:.2} ms = tokenize {:.2} + inference {:.2} + other {:.2}",
+            batch_size,
+            m_tot,
+            m_tok,
+            m_inf,
+            m_tot - m_tok - m_inf
+        );
         let throughput = total_texts as f64 / overall_elapsed_s;
 
         let p50 = hist.value_at_percentile(50.0) as f64 / 1000.0;
