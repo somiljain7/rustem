@@ -74,7 +74,7 @@ the verified results.
 | 64 | 322.56 / 364.29 | 197.5 | 849.41 / 1224.70 | 287.1 |
 
 Notes on these numbers:
-- They are **slower than the README headline** (5.15 ms p50 at batch 1, about 182 texts/s). The cause was not isolated. Candidates: this MinGW build vs the original build, other processes running during the test, laptop thermals, and only 30 iterations. Re-run on an idle machine before quoting them.
+- These were **slower than the README headline** (5.15 ms p50 at batch 1). A later re-run with 100 iterations and 10 warmups gave 5.05 to 5.29 ms at batch 1 on the same MinGW build (section 7), matching the README. So the MinGW build is not slower. The earlier slow run (30 iterations) was most likely noise or background load, which was not proven. Use 100+ iterations on an idle machine before quoting numbers.
 - With 4 clients, batch-1 throughput roughly doubles (136 to 284 texts/s) but tail latency grows sharply (p95 about 30 ms). 4 clients x 2 intra-threads oversubscribe a 4-core CPU. For latency-sensitive voice use, consider fewer threads per session.
 
 ## 5. Not verified / open items
@@ -119,6 +119,17 @@ Install each in its own venv; point `ORT_DYLIB_PATH` at that venv's `onnxruntime
 - The advantage is a **batch-1 latency** win only. At batch 8 and 16 every path is within noise of plain CPU (compute-bound), so OpenVINO does not help throughput here.
 - Reaching about 39 ms inside the Rust service would need the native OpenVINO API (for example the `openvino` crate or the C API), a bigger change than the provider backend. Not done.
 - The native probe used fixed token ids, so it measures forward-pass time only. Tokenization and pooling are excluded.
+
+### SIMD in this project
+- The repo contains **no explicit SIMD** (no `std::arch`, `portable_simd`, `#[target_feature]`, or SIMD crates). Inference SIMD (AVX2/FMA) lives inside ONNX Runtime and OpenVINO's C++ kernels, which pick instruction sets at runtime. Our Rust only does scalar `f32` loops for pooling, normalization and cosine similarity (a few hundred to 768 floats per text).
+- `RUSTFLAGS="-C target-cpu=native"` was tested (compiler saw `avx avx2 bmi2 fma sse4.2`, no `avx512f`). e5-small, 4 sessions x 2 threads, 100 iterations, baseline vs native alternated twice:
+
+| Batch | Baseline p50 (round 1 / 2) | Native p50 (round 1 / 2) |
+|---:|---|---|
+| 1 | 5.29 / 5.05 ms | 5.29 / 5.08 ms |
+| 16 | 61.76 / 65.44 ms | 61.12 / 65.31 ms |
+
+  No measurable gain, which is expected: inference runs in the C++ libraries, and our own loops are microseconds. A native build is also not portable to other CPUs, so it is **not** enabled by default. To try it anyway: `$env:RUSTFLAGS="-C target-cpu=native"; $env:CARGO_TARGET_DIR="target-native"; cargo build --release` (the `target-native/` folder is git-ignored).
 
 ### New issues faced
 | # | Symptom | Cause | Fix |
