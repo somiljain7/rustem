@@ -167,7 +167,50 @@ Trade-off: the converted model is 1.18 GB on disk (vs 295 MB) and uses that much
 - At batch 16 the improvement is about 27% (496 -> 363 ms), because the matrix math dominates there.
 - Caveat: I did not check whether e5-small (the default model) has the same pattern; its INT8 file is a different export and was not profiled.
 
+### Speed-up experiments on Gemma (2026-11-15, plain ORT CPU, 4 threads, 202-utterance eval set)
+Scripts: `scripts/experiments/exp6_prefix.py` (prefix sweep: Recall + batch-1 p50), `exp7_quant.py` (builds INT4 and dynamic-INT8 variants from the folded model). Batch-1 latency is from Python ORT 1.20.1 on a sample of 24 utterances.
+
+| Model variant | Prefix | Avg tokens | Recall@1 | Recall@5 | MRR | Batch 1 p50 |
+|---|---|---|---|---|---|---|
+| fp32 (folded) | `task: search result \| query: ` (model card) | 16.2 | 96.53% | 100.00% | 0.9804 | 41.3 ms |
+| fp32 (folded) | `task: search \| ` | 13.2 | 98.02% | 99.50% | 0.9884 | 38.1 ms |
+| fp32 (folded) | `query: ` | 11.2 | 98.02% | 100.00% | 0.9889 | 36.8 ms |
+| fp32 (folded) | none | 9.4 | 96.53% | 100.00% | 0.9776 | 33.7 ms |
+| INT4 weight-only (MatMulNBits, block 32) | model card | 16.2 | 95.54% | 100.00% | 0.9765 | 55.5 ms |
+| INT4 weight-only | `query: ` | 11.2 | 97.03% | 99.50% | 0.9816 | 48.5 ms |
+| **Dynamic INT8 (MatMulInteger)** | model card | 16.2 | 97.03% | 100.00% | 0.9837 | **34.3 ms** |
+| **Dynamic INT8** | `task: search \| ` | 13.2 | 98.02% | 99.50% | 0.9884 | 24.2 ms |
+| **Dynamic INT8** | `query: ` | 11.2 | 98.51% | 100.00% | 0.9913 | **19.0 ms** |
+| Dynamic INT8 | none | 9.4 | 98.02% | 100.00% | 0.9859 | 16.8 ms |
+
+Rust service, dynamic-INT8 model, model-card prefix: batch 1 p50 **31.6 ms** (vs 34.3 ms folded fp32); batch 16 p50 **~401 ms** (vs ~355 ms folded fp32, so it is *slower* at batch 16).
+
+What this shows:
+- **Shorter prefix:** about 10% less latency per step (41 -> 37 ms for `query: `) and no measurable quality loss. Differences of 1 to 3 utterances out of 202 are within noise, so read this as "no evidence of harm", not "better".
+- **Dynamic INT8 is the largest gain**, and it surprised me: AVX2 without VNNI still runs the integer matmul faster than fp32 at small batch. Combined with the `query: ` prefix, batch 1 goes 41 -> 19 ms in Python (about 2x) with Recall@1 within noise (98.5% vs 96.5%).
+- **It does not help batches**: in the Rust service batch 16 got slower (401 vs 355 ms). Use it for single-request, latency-sensitive traffic; keep fp32 for large batches.
+- **INT4 does not help on this CPU**: slower than fp32 (55 vs 41 ms), unpacking overhead on AVX2. Recall is about the same.
+- **Not checked:** cosine fidelity of the dynamic-INT8 model against fp32 (only retrieval metrics), a larger or non-synthetic eval set, and Rust batch 1 with the shorter prefix (the Python number is used for that row). The `query: ` prefix departs from the model card, so re-check on real traffic before switching.
+
+**Dynamic INT8 on the OpenVINO provider (onnxruntime-openvino 1.24.1 + OpenVINO 2025.4.1, batch-1 p50, Python, `EP=openvino`):**
+
+| Model | Provider | Model-card prefix | `query: ` prefix |
+|---|---|---|---|
+| Dynamic INT8 | OpenVINO | 189.9 ms | 170.4 ms |
+| fp32 (folded) | OpenVINO | 94.6 ms | 77.5 ms |
+| Dynamic INT8 | plain ORT 1.24.1 CPU | 22.8 ms | 17.2 ms |
+| fp32 (folded) | plain ORT 1.24.1 CPU | 41.2 ms | 32.6 ms |
+
+So OpenVINO is **not** better with dynamic INT8: it is about 8x slower than plain ORT CPU on the same model, and INT8 is slower than fp32 on OpenVINO (190 vs 95 ms). The OpenVINO provider path is slow in this Python harness even for fp32 (95 vs 41 ms), most likely because batch-1 inputs of different lengths trigger re-compilation or poor graph partitioning of the ONNX graph; I did not investigate which. Native OpenVINO (not through the ORT provider) measured ~35 ms earlier, so use that comparison, not this one, for fp32. Recall is unchanged.
+Side result: plain ORT 1.24.1 runs the same models faster than 1.20.1 (dynamic INT8 22.8 vs 34.3 ms, fp32 41.2 vs 41.3 ms at the model-card prefix), so a newer ORT may help the Rust service too. Not tested in Rust (needs a matching `ort` crate and DLL).
+
+Reproduce:
+```powershell
+python scripts/experiments/exp7_quant.py <scratch>/gemma_fp32w/model_fp32w.onnx <scratch>/gemma_q
+python scripts/experiments/exp6_prefix.py <scratch>/gemma_q/gemma_dyn8.onnx models/gemma/tokenizer.json
+```
+
 ### Not done
 - Exact FLOP count from the graph (the per-token cost was only compared between engines).
-- Padding experiment and the full Gemma quality eval on the converted model (fidelity checked on 3 sentences only).
+- Padding experiment; cosine fidelity of the folded fp32 model was checked on 3 sentences only (retrieval metrics above are now measured).
 - oneDNN built into ONNX Runtime (no evidence it would help: ORT and OpenVINO already match per token).
